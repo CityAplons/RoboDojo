@@ -10,12 +10,15 @@ class CustomDirectRLEnv(DirectRLEnv):
             return bool(self.sim.is_rendering)
         return self.sim.has_gui() or self.sim.has_rtx_sensors()
 
-    def sim_step(self, render: bool = True):
+    def sim_step(self, render: bool = True, *, resume_usd_output: bool = False):
         is_rendering = self._needs_render()
 
-        for _ in range(self.cfg.decimation):
+        for substep in range(self.cfg.decimation):
             self._sim_step_counter += 1
             self.scene.write_data_to_sim()
+            if resume_usd_output and substep == self.cfg.decimation - 1:
+                # The final real fetch also publishes particle-cloth meshes.
+                self.sim.get_physics_context().set_physx_update_transformations_settings(update_to_usd=True)
             self.sim.step(render=False)
             if (
                 self.cfg.sim.render_interval > 0
