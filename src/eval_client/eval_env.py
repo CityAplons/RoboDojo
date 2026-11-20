@@ -641,7 +641,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         @contextmanager
         def _defer_usd_updates(self):
             """Publish at the action boundary; failed actions follow normal reset recovery."""
-            if self.use_fabric:
+            if self.use_fabric or self.physics_context is None:
                 yield False
                 return
             update_usd, velocities, _ = self.physics_context.get_physx_update_transformations_settings()
