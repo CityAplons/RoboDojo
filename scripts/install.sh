@@ -16,17 +16,18 @@ pip_install_with_isaac_constraints() {
   local constraints
   constraints="$(mktemp)"
   cat >"$constraints" <<'EOF'
-numpy==1.26.0
-packaging==23.0
-typing_extensions==4.12.2
-filelock==3.13.1
+numpy==2.3.1
+packaging==26.0
+typing_extensions==4.16.0
+filelock==3.25.2
+httpx2==2.3.0
 websockets==12.0
-scipy==1.15.3
-warp-lang==1.11.0
-click==8.1.7
+scipy==1.17.0
+warp-lang==1.19.0
+click==8.5.1
 psutil==5.9.8
 wheel==0.45.1
-starlette==0.45.3
+starlette==1.8.0
 stable-baselines3<2.8
 onnx>=1.18,<1.22
 ipython<9
@@ -42,25 +43,26 @@ EOF
 }
 ensure_torch_cuda_stack() {
   if ! python -m pip show torchaudio &>/dev/null; then
-    warn "    torchaudio missing, installing PyTorch cu128 stack..."
-    pip_install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
-      --index-url https://download.pytorch.org/whl/cu128
+    warn "    torchaudio missing, installing PyTorch cu130 stack..."
+    pip_install "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" \
+        --index-url "https://download.pytorch.org/whl/cu130"
   fi
 }
 pin_runtime_deps() {
   pip_install \
-    "numpy==1.26.0" \
-    "packaging==23.0" \
-    "typing_extensions==4.12.2" \
-    "filelock==3.13.1" \
+    "numpy==2.3.1" \
+    "packaging==26.0" \
+    "typing_extensions==4.16.0" \
+    "filelock==3.25.2" \
     "websockets==12.0" \
-    "click==8.1.7" \
+    "click==8.5.1" \
     "psutil==5.9.8" \
     "wheel==0.45.1" \
-    "starlette==0.45.3" \
-    "scipy==1.15.3" \
-    "warp-lang==1.11.0" \
+    "starlette==1.8.0" \
+    "scipy==1.17.0" \
+    "warp-lang==1.19.0" \
     "onnx>=1.18,<1.22" \
+    "idna==3.10" \
     "ipython<9" \
     "virtualenv==20.30.0"
   # virtualenv 21.x pulled this in; virtualenv 20.x doesn't need it and it
@@ -103,8 +105,8 @@ setup_conda() {
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
   fi
   if ! conda env list | grep -q "^RoboDojo "; then
-    info "    Creating conda environment 'RoboDojo' (Python 3.11)..."
-    conda create -n RoboDojo python=3.11 -y
+    info "    Creating conda environment 'RoboDojo' (Python 3.12)..."
+    conda create -n RoboDojo python=3.12 -y
   else
     warn "    Conda environment 'RoboDojo' already exists, skipping..."
   fi
@@ -115,8 +117,8 @@ setup_conda() {
 setup_base_deps() {
   info "[2/7] Installing base pip dependencies..."
   pip_install -r "$CURRENT_DIR/scripts/requirements.txt"
-  pip_install opencv-python-headless==4.11.0.86 pillow matplotlib "scipy==1.15.3" scikit-learn
-  pip_install numpy==1.26.0
+  pip_install opencv-python-headless==4.11.0.86 pillow matplotlib "scipy==1.17.0" scikit-learn
+  pip_install numpy==2.3.1
 }
 setup_submodules() {
   cd "$CURRENT_DIR" || exit 1
@@ -134,16 +136,16 @@ setup_submodules() {
     || error "XPolicyLab init failed. Check repo access."
 }
 setup_isaacsim() {
-  if ! python -m pip show isaacsim 2>/dev/null | grep -q "5.1.0"; then
-    info "[4/7] Installing PyTorch + IsaacSim 5.1..."
+  if ! python -m pip show isaacsim 2>/dev/null | grep -q "6.1.0"; then
+    info "[4/7] Installing PyTorch + IsaacSim 6.1..."
     pip_install --upgrade pip
-    pip_install "numpy==1.26.0" "typing_extensions==4.12.2" "filelock==3.13.1"
-    pip_install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
-      --index-url https://download.pytorch.org/whl/cu128
-    pip_install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
+    pip_install "numpy==2.3.1" "typing_extensions==4.16.0" "filelock==3.25.2"
+    pip_install "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" \
+        --index-url "https://download.pytorch.org/whl/cu130"
+    pip_install "isaacsim[all,extscache]==6.1.0" --extra-index-url https://pypi.nvidia.com
     pin_runtime_deps
   else
-    warn "[4/7] IsaacSim 5.1.0 already installed, skipping..."
+    warn "[4/7] IsaacSim 6.1.0 already installed, skipping..."
     ensure_torch_cuda_stack
   fi
 }
@@ -181,7 +183,7 @@ PY
     info "[6/7] Installing CuRobo..."
     cd third_party/curobo || error "third_party/curobo not found"
     python -m pip uninstall -y nvidia-curobo curobo 2>/dev/null || true
-    pip_install_with_isaac_constraints -e ".[cu12]" --no-build-isolation
+    pip_install_with_isaac_constraints -e ".[cu13]" --no-build-isolation
     cd "$CURRENT_DIR"
     pin_runtime_deps
   else
