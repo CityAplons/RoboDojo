@@ -1,10 +1,11 @@
+import inspect
 import os
 
 import carb
 from isaacsim.core.utils.prims import delete_prim, is_prim_path_valid
 from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
 from isaacsim.core.utils.string import find_unique_string_name
-from isaacsim.replicator.behavior.utils.scene_utils import create_mdl_material
+from utils.usd_compat import create_mdl_material
 import numpy as np
 from omegaconf import DictConfig, ListConfig
 import omni.kit.commands
@@ -12,6 +13,22 @@ from omni.physx.scripts import particleUtils, physicsUtils
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, Vt
 from scipy.spatial import Delaunay
 import torch
+
+
+def _call_with_supported_kwargs(fn, **kwargs):
+    """Call a PhysX helper, dropping keywords removed in later Isaac Sim releases.
+
+    :param fn: particle utility
+    :param kwargs: candidate keyword arguments
+    :return: the helper's return value
+    """
+    parameters = inspect.signature(fn).parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return fn(**kwargs)
+    unsupported = sorted(key for key in kwargs if key not in parameters)
+    if unsupported:
+        print(f"[fluid] ignoring unsupported particle material fields: {unsupported}")
+    return fn(**{key: value for key, value in kwargs.items() if key in parameters})
 
 
 class FluidObject:
@@ -201,7 +218,8 @@ class FluidObject:
         create_mdl_material(material_url, material_name, color_material_path)
 
         inst_particle_material_cfg = self.physics_cfg.get("particle_material", {})
-        particleUtils.add_pbd_particle_material(
+        _call_with_supported_kwargs(
+            particleUtils.add_pbd_particle_material,
             stage=self.stage,
             path=color_material_path,
             adhesion=inst_particle_material_cfg.get("adhesion"),
