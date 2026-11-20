@@ -56,10 +56,10 @@ DEFAULT_RENDER_CONFIG = {
     "enable_translucency": True,
     "enable_reflections": True,
     "enable_global_illumination": True,
-    "antialiasing_mode": "DLAA",
+    "antialiasing_mode": "DLSS",
     "enable_dlssg": None,
     "enable_dl_denoiser": None,
-    "dlss_mode": 2,
+    "dlss_mode": 1,
     "enable_direct_lighting": None,
     "samples_per_pixel": None,
     "enable_shadows": None,
@@ -193,11 +193,11 @@ class BaseEnv(gym.Env):
         _apply_render_settings(self.sim_cfg.sim, render_config, frequency_settings)
         _apply_physx_settings(get_physx_cfg(self.sim_cfg.sim), physx_config)
 
-    def sim_step(self, render: bool = True):
+    def sim_step(self, render: bool = True, *, resume_usd_output: bool = False):
         """
         sim backend step
         """
-        self.sim.sim_step(render=render)
+        self.sim.sim_step(render=render, resume_usd_output=resume_usd_output)
 
     def setup_physics(self, sim: IsaacRLEnv):
         """
