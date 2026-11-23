@@ -2,6 +2,8 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from importlib import import_module
+import os
+import random
 from typing import List, Literal
 
 from isaaclab.assets.articulation import ArticulationCfg
@@ -10,6 +12,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import torch
 import transforms3d as t3d
+import warp as wp
 
 from env.environment.isaac.compat import pose_from_lab, quat_to_lab
 from env.environment.isaac.isaac_rl_env import IsaacRLEnv
@@ -44,6 +47,8 @@ class RobotManager:
         self.use_scene_cfg = []
         self.planner = dict()
         self.ik_solver = dict()
+        # cuRobo planners are only needed for end-effector IK; build them on first use.
+        self._planner_robots = dict()
         self.robot_origin_endpose = None
         self.robot_init_joint = [dict() for _ in range(self.num_envs)]
         for idx, cfg in enumerate(self.robots_cfg):
@@ -51,7 +56,7 @@ class RobotManager:
                 robot = self._get_robot(cfg, idx)
                 self.robot_list.append(robot)
                 self.use_scene_cfg.append(True)
-                if robot.robot_name not in self.planner and cfg.get("need_planner", True):
+                if robot.robot_name not in self._planner_robots and cfg.get("need_planner", True):
                     self._setup_planner(robot)
                 robot.type = cfg.get("type", "target")
                 self.target_arm_nums += 1 if robot.type == "target" else 0
@@ -61,9 +66,9 @@ class RobotManager:
                 self.use_scene_cfg.append(True)
                 self.robot_list.append(right_robot)
                 self.use_scene_cfg.append(False)
-                if left_robot.robot_name not in self.planner and cfg.get("need_planner", True):
+                if left_robot.robot_name not in self._planner_robots and cfg.get("need_planner", True):
                     self._setup_planner(left_robot)
-                if right_robot.robot_name not in self.planner and cfg.get("need_planner", True):
+                if right_robot.robot_name not in self._planner_robots and cfg.get("need_planner", True):
                     self._setup_planner(right_robot)
                 left_robot.type = cfg.get("type", "target")
                 right_robot.type = cfg.get("type", "target")
@@ -347,7 +352,7 @@ class RobotManager:
         trans_target_pose = deepcopy(target_pose)
         if trans == "relative":
             trans_target_pose = self._trans_from_endlink_to_gripper(target_pose, robot)
-        planner = self.ik_solver[robot.robot_name]
+        planner = self._get_ik_solver(robot)
         robot_pose = deepcopy(robot.entity_origin_pose)
         return planner.solve_ik_to_joint(now_qpos, trans_target_pose, real_robot_pose=robot_pose)
 
@@ -393,15 +398,31 @@ class RobotManager:
                 batch[row] = value
             return torch.as_tensor(batch, device=sim.device)
 
+        def joint_ids(arm, indices):
+            # Isaac Lab converts list joint ids to a new warp array on every call; the
+            # robot's joint indices are fixed per articulation, so convert them once.
+            cache = arm.__dict__.setdefault("_robodojo_joint_ids", {})
+            key = (tuple(indices), str(sim.device))
+            if key not in cache:
+                cache[key] = wp.array(list(indices), dtype=wp.int32, device=str(sim.device))
+            return cache[key]
+
         for robot, arm in arms:
             arm_name = self.process_name(robot.arm_name)
             gripper_name = self.process_name(robot.gripper_name)
             arm_position = targets(arm_name, "position", len(robot.arm_joint_indices))
             arm_velocity = targets(arm_name, "velocity", len(robot.arm_joint_indices))
             gripper_position = targets(gripper_name, "position", len(robot.gripper_joint_indices))
-            arm.set_joint_position_target(arm_position, joint_ids=robot.arm_joint_indices, env_ids=env_ids)
-            arm.set_joint_velocity_target(arm_velocity, joint_ids=robot.arm_joint_indices, env_ids=env_ids)
-            arm.set_joint_position_target(gripper_position, joint_ids=robot.gripper_joint_indices, env_ids=env_ids)
+            # Arm and gripper joints are disjoint, so one position write is equivalent to two.
+            position_joints = list(robot.arm_joint_indices) + list(robot.gripper_joint_indices)
+            arm.set_joint_position_target(
+                torch.cat([arm_position, gripper_position], dim=1),
+                joint_ids=joint_ids(arm, position_joints),
+                env_ids=env_ids,
+            )
+            arm.set_joint_velocity_target(
+                arm_velocity, joint_ids=joint_ids(arm, robot.arm_joint_indices), env_ids=env_ids
+            )
 
     def _trans_from_endlink_to_gripper(self, target_pose, robot):
         inv_delta_matrix = robot.inv_delta_matrix
@@ -534,7 +555,25 @@ class RobotManager:
         return scene_cfg
 
     def _setup_planner(self, robot):
-        if robot.robot_type == "arm":
+        if robot.robot_type != "arm":
+            return
+        self._planner_robots[robot.robot_name] = robot
+        if os.environ.get("ROBODOJO_EAGER_PLANNER") == "1":
+            self._build_planner(robot)
+
+    def _get_ik_solver(self, robot):
+        if robot.robot_name not in self.ik_solver:
+            self._build_planner(self._planner_robots[robot.robot_name])
+        return self.ik_solver[robot.robot_name]
+
+    def _build_planner(self, robot):
+        # Building and warming up cuRobo draws random numbers. Restore every RNG so a
+        # planner built mid-episode leaves the episode's random streams untouched,
+        # exactly as when planners were built before seeding.
+        py_state, np_state = random.getstate(), np.random.get_state()
+        torch_state = torch.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
             root_pose = deepcopy(robot.entity_origin_pose)
             self.planner[robot.robot_name] = CuroboPlanner(
                 robot_origin_pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
@@ -545,6 +584,12 @@ class RobotManager:
                 table_height=0.74 - root_pose[2],
             )
             self.ik_solver[robot.robot_name] = self.planner[robot.robot_name]
+        finally:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+            torch.set_rng_state(torch_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
 
     def _set_robot_obs_name(self):
         if self.target_arm_nums == 1:

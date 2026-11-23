@@ -1,7 +1,9 @@
 import json
 import os
 from pathlib import Path
+import queue
 import subprocess
+import threading
 from typing import Any
 
 import numpy as np
@@ -28,7 +30,12 @@ class VideoStreamWriter:
     as it arrives, so an episode's frames are never all held in memory at once.
     Use ``append`` per frame, then ``close`` to finalize a valid file or
     ``abort`` to discard the partial output.
+
+    Frames are handed to a writer thread through a bounded queue so the caller
+    does not block while ffmpeg encodes; ``close`` drains every queued frame.
     """
+
+    _QUEUE_FRAMES = 64
 
     def __init__(
         self,
@@ -78,22 +85,51 @@ class VideoStreamWriter:
             ],
             stdin=subprocess.PIPE,
         )
+        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=self._QUEUE_FRAMES)
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._drain, name=f"video:{os.path.basename(out_path)}", daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        stdin = self.proc.stdin
+        while True:
+            data = self._queue.get()
+            if data is None:
+                return
+            if self._error is not None:
+                continue  # keep consuming so producers never block on a dead pipe
+            try:
+                stdin.write(data)
+            except BaseException as e:  # noqa: BLE001 - re-raised on the caller thread
+                self._error = e
+
+    def _stop_thread(self) -> None:
+        if self._thread is not None:
+            self._queue.put(None)
+            self._thread.join()
+            self._thread = None
 
     def append(self, frame: np.ndarray) -> None:
         if self.proc is None:
             raise RuntimeError("Cannot append to a closed VideoStreamWriter.")
+        if self._error is not None:
+            raise OSError(f"ffmpeg pipe failed for `{self.out_path}`.") from self._error
         if frame.ndim != 3 or frame.shape[0] != self.height or frame.shape[1] != self.width:
             raise ValueError(
                 f"Frame shape {tuple(frame.shape)} does not match writer ({self.height}x{self.width}x{self.channels})."
             )
         frame = np.ascontiguousarray(frame, dtype=np.uint8)
-        self.proc.stdin.write(frame.tobytes())
+        # tobytes() copies, so the caller may reuse its buffer immediately.
+        self._queue.put(frame.tobytes())
         self.n_frames += 1
 
     def close(self, *, announce: bool = True) -> None:
         if self.proc is None:
             return
         try:
+            self._stop_thread()
+            if self._error is not None:
+                raise OSError(f"ffmpeg pipe failed for `{self.out_path}`.") from self._error
             self.proc.stdin.close()
             if self.proc.wait() != 0:
                 raise OSError(f"ffmpeg failed while finalizing `{self.out_path}`.")
@@ -114,12 +150,20 @@ class VideoStreamWriter:
         """Kill the ffmpeg process and remove the partial output file."""
         if self.proc is not None:
             try:
+                # Kill first so a writer thread blocked on a full pipe gets EPIPE and exits.
+                self.proc.kill()
+            except Exception:
+                pass
+            try:
+                self._stop_thread()
+            except Exception:
+                pass
+            try:
                 if self.proc.stdin is not None:
                     self.proc.stdin.close()
             except Exception:
                 pass
             try:
-                self.proc.kill()
                 self.proc.wait()
             except Exception:
                 pass

@@ -8,8 +8,20 @@ class MetaControl:  # Single control signal for one env step
     def __init__(self, control_info_dict=None):
         self.gripper_velocity_constant = 1.0
         self.control_info_dict = control_info_dict if control_info_dict is not None else dict()
+        self._action_memo = None
 
     def get_action(self, robot_manager, env_idx):
+        # Within one joint snapshot the robot state cannot change, so repeated calls
+        # (ControlManager.pop, then RobotManager.control_robot) return the same action.
+        snapshot = getattr(robot_manager, "_joint_read_cache", None)
+        memo = self._action_memo
+        if snapshot is not None and memo is not None and memo[0] is snapshot and memo[1] == env_idx:
+            return memo[2]
+        res = self._compute_action(robot_manager, env_idx)
+        self._action_memo = (snapshot, env_idx, res) if snapshot is not None else None
+        return res
+
+    def _compute_action(self, robot_manager, env_idx):
         def get_dict(control_info_key):
             position = self.control_info_dict[control_info_key]["position"]
             velocity = (

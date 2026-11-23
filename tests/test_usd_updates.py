@@ -8,6 +8,8 @@ import unittest
 
 from source_methods import load_class
 
+from utils import eval_profiler
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -26,7 +28,7 @@ def eval_methods():
         for n in cls.body
         if isinstance(n, ast.FunctionDef) and n.name in {"_defer_usd_updates", "step", "take_action_batch"}
     ]
-    scope = dict(contextmanager=contextmanager, ControlBase=ControlBase)
+    scope = dict(contextmanager=contextmanager, ControlBase=ControlBase, eval_profiler=eval_profiler)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), str(path), "exec"), scope)
     return scope["EvalEnv"]
 

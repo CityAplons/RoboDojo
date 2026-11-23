@@ -346,12 +346,14 @@ run_client() {
   local dimensions=""
   local limit=""
   local dry_run="false"
+  local single_launch="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dataset) need_value "$@"; dataset="$2"; shift 2 ;;
       --task) need_value "$@"; task="$2"; shift 2 ;;
       --env-cfg) need_value "$@"; env_cfg="$2"; shift 2 ;;
+      --single-launch) single_launch="true"; shift ;;
       --policy-name) need_value "$@"; policy_name="$2"; shift 2 ;;
       --policy-dir) need_value "$@"; policy_dir="$(abs_path "$2")"; shift 2 ;;
       --policy-host) need_value "$@"; policy_host="$2"; shift 2 ;;
@@ -389,8 +391,12 @@ Batch mode:
   count must both equal the group count. If `--policy-host` contains one host,
   `--policy-port` count must equal the group count and the host is reused.
 
+Single launch:
+  `--task a,b,c` evaluates the listed tasks sequentially in one Isaac Sim launch.
+  In batch mode, `--single-launch` does the same for each client worker's task group.
+
 Required:
-  --task TASK            RoboDojo task name
+  --task TASK            RoboDojo task name (or comma-separated list, see above)
   --policy-name NAME     XPolicyLab deploy module (XPolicyLab/policy/<NAME>/deploy.py)
                          Omit when --policy-dir is set (name inferred from directory)
   --policy-dir PATH      Same as eval's --policy-dir; sets --policy-name from basename
@@ -411,6 +417,7 @@ Common options:
   --tasks-file PATH      Batch mode task subset file
   --dimension NAMES      Batch mode capability dimensions
   --limit NUM            Batch mode task limit after filtering
+  --single-launch        Batch mode: one Isaac Sim launch per worker instead of per task
   --dry-run              Print the resolved eval_policy.sh command without running it
 EOF
         return 0
@@ -484,6 +491,9 @@ EOF
     fi
     if [[ -n "${limit}" ]]; then
       batch_args+=(--limit "${limit}")
+    fi
+    if [[ "${single_launch}" == "true" ]]; then
+      batch_args+=(--single-launch)
     fi
     if [[ -n "${eval_num}" ]]; then
       batch_args+=(--eval-num "${eval_num}")

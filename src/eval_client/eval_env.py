@@ -15,6 +15,7 @@ from env.global_configs import *
 from env.global_configs import BENCHMARK
 from env.observation_manager.obs_manager import ObsManager
 from env.seed_manager.seed_manager import SeedManager
+from utils import eval_profiler
 from utils.cluttered_generator import UnStableError
 from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
@@ -196,6 +197,17 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 ws_ping_timeout_s=self.deploy_cfg.get("ws_ping_timeout_s", 20.0),
             )
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
+            if eval_profiler.ENABLED:
+                self._profile_model_client_calls()
+
+        def _profile_model_client_calls(self):
+            call = self.model_client.call
+
+            def timed_call(func_name=None, obs=None, **kwargs):
+                with eval_profiler.span(f"policy.{func_name}"):
+                    return call(func_name=func_name, obs=obs, **kwargs)
+
+            self.model_client.call = timed_call
 
         def close(self):
             self._abort_video_writers()
@@ -246,21 +258,24 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.model_client.call(func_name="reset")
 
         def setup_scene(self):
-            self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
+            with eval_profiler.span("setup_scene.apply_saved_poses"):
+                self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
             self._align_layout_success()
-            success, unstable_envs = self.scene_manager.layout_manager.check_layout_stability(self)
+            with eval_profiler.span("setup_scene.stability_check"):
+                success, unstable_envs = self.scene_manager.layout_manager.check_layout_stability(self)
             unstable_envs = [idx for idx in set(unstable_envs) if idx < self.num_envs]
             self.unstable_nums += len(unstable_envs)
             self.episode_nums -= len(unstable_envs)
             if not success or self.episode_nums <= 0:
                 raise UnStableError("All scene Unstable Error!")
-            for _ in range(10):
-                self.render()
-            for idx in range(200):
-                self.sim_step()
-                if idx % 5 == 0:
-                    self.obs_manager.render_for_capture()
-                    self.obs_manager.get_obs()
+            with eval_profiler.span("setup_scene.settle"):
+                for _ in range(10):
+                    self.render()
+                for idx in range(200):
+                    self.sim_step()
+                    if idx % 5 == 0:
+                        self.obs_manager.render_for_capture()
+                        self.obs_manager.get_obs()
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
 
@@ -274,13 +289,17 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 env_idx_list = list(range(self.num_envs))
             if self.physx_monitor_enabled:
                 self._check_endpose_finite(env_idx_list)
-            self.obs_manager.render_for_capture()
-            data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
+            with eval_profiler.span("obs.render_for_capture"):
+                self.obs_manager.render_for_capture()
+            with eval_profiler.span("obs.get_obs"):
+                data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
             data_list = []
             for env_idx in env_idx_list:
                 if not self.end_flag[env_idx] or last_frame:
-                    self._stream_vision(env_idx, data[env_idx])
-                env_data = deepcopy(data[env_idx])
+                    with eval_profiler.span("obs.stream_video"):
+                        self._stream_vision(env_idx, data[env_idx])
+                with eval_profiler.span("obs.deepcopy"):
+                    env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
                 data_list.append(env_data)
             return data_list
@@ -452,12 +471,15 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 if not self.have_empty(env_idx_list):
                     with self._defer_usd_updates() as defer_usd:
                         while not self.have_empty(env_idx_list):
-                            self.step(env_idx_list=env_idx_list, defer_usd=defer_usd)
+                            with eval_profiler.span("action.physics_step"):
+                                self.step(env_idx_list=env_idx_list, defer_usd=defer_usd)
                             if self.physx_monitor_enabled:
-                                self._check_physx_broken_envs()
-                                self._check_endpose_finite(env_idx_list)
+                                with eval_profiler.span("action.physx_monitor"):
+                                    self._check_physx_broken_envs()
+                                    self._check_endpose_finite(env_idx_list)
 
-            self.reward_manager.step(env_idx_list=env_idx_list)
+            with eval_profiler.span("action.reward_step"):
+                self.reward_manager.step(env_idx_list=env_idx_list)
             if getattr(self, "interact", False):
                 if hasattr(self, "query_support_arm_traj"):
                     for env_idx in env_idx_list:
@@ -859,6 +881,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 self.eval_result["score"] = self.total_score / eval_time * 100
             self.eval_result["eval_time"] = eval_time
             save_json(self.eval_result, os.path.join(self.save_dir, "_result.json"))
+            eval_profiler.dump(os.path.join(self.save_dir, "profile.json"))
             # Refresh the resume manifest at the end of every batch so that a
             # downstream SIGABRT (which beats the in-process PhysXFatalError
             # handler) still recovers everything up to the previous batch.
@@ -876,7 +899,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 ):
                     final_check = True
                     break
-            reward_list = self.reward_manager.get_reward(final_check=final_check)
+            with eval_profiler.span("episode_end.get_reward"):
+                reward_list = self.reward_manager.get_reward(final_check=final_check)
             for env_idx in range(self.num_envs):
                 if self.end_flag[env_idx]:
                     continue

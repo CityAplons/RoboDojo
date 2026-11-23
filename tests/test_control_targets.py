@@ -5,6 +5,7 @@ from unittest.mock import patch
 import numpy as np
 from source_methods import load_class
 import torch
+import warp as wp
 
 from env.robot_manager.control_manager import MetaControl
 
@@ -25,7 +26,7 @@ class ControlTargetsTest(unittest.TestCase):
             "env/robot_manager/robot_manager.py",
             "RobotManager",
             ["control_robot"],
-            dict(np=np, torch=torch, MetaControl=MetaControl),
+            dict(np=np, torch=torch, wp=wp, MetaControl=MetaControl),
         )
         obj = cls()
         obj.sim = SimpleNamespace(sim=SimpleNamespace(device=device))
@@ -50,7 +51,7 @@ class ControlTargetsTest(unittest.TestCase):
         calls = []
 
         def capture(value, joint_ids, env_ids):
-            calls.append((value.clone(), list(joint_ids), env_ids.clone()))
+            calls.append((value.clone(), joint_ids.numpy().tolist(), env_ids.clone()))
 
         shared = SimpleNamespace(set_joint_position_target=capture, set_joint_velocity_target=capture)
         obj.robot_key = [shared, shared]
@@ -87,12 +88,10 @@ class ControlTargetsTest(unittest.TestCase):
         controls = self.controls(tensor_device)
         obj.control_robot(controls)
         expected = [
-            [[1.1, 2.2], [3.3, 4.4]],
+            [[1.1, 2.2, 0.2, -0.2], [3.3, 4.4, 0.9, -0.9]],
             [[0.5, 0.5], [0.7, 0.8]],
-            [[0.2, -0.2], [0.9, -0.9]],
-            [[4.0], [5.0]],
+            [[4.0, 0.4], [5.0, 0.6]],
             [[0.0], [0.1]],
-            [[0.4], [0.6]],
         ]
         self.assertEqual(len(calls), len(expected))
         for (value, joints, envs), target in zip(calls, expected):
@@ -101,7 +100,7 @@ class ControlTargetsTest(unittest.TestCase):
             self.assertEqual(envs.tolist(), [0, 2])
             self.assertEqual(envs.dtype, torch.int32)
             self.assertEqual(value.device, envs.device)
-        self.assertEqual([call[1] for call in calls], [[2, 0], [2, 0], [1, 3], [4], [4], [5]])
+        self.assertEqual([call[1] for call in calls], [[2, 0, 1, 3], [2, 0], [4, 5], [4]])
         self.assertEqual(controls[0].calls, [0])
         self.assertEqual(controls[2].calls, [2])
 
@@ -137,3 +136,43 @@ class ControlTargetsTest(unittest.TestCase):
         obj.control_robot(controls)
         self.assertEqual(calls, [])
         self.assertEqual(controls[0].calls, [])
+
+
+class MetaControlMemoTest(unittest.TestCase):
+    def fixture(self):
+        robot = SimpleNamespace(ee_type="gripper", gripper_scale=[0.0, 1.0], gripper_move={"mimic": [0, 1.0, 0.0]})
+        reads = []
+
+        def real_val(robot, env_idx_list):
+            reads.append(env_idx_list)
+            return {env_idx_list[0]: np.array([0.5])}
+
+        manager = SimpleNamespace(
+            _joint_read_cache=None,
+            get_robot_obs_name=lambda: ["arm_joint_state", "ee_joint_state"],
+            restore_name=lambda name: name,
+            get_robot_by_gripper_name=lambda name: robot,
+            get_end_effector_real_val=real_val,
+        )
+        control = MetaControl(
+            {"arm_joint_state": {"position": [0.1, 0.2]}, "ee_joint_state": {"position": [0.55, 0.55]}}
+        )
+        return manager, control, reads
+
+    def test_repeated_calls_share_one_snapshot_result(self):
+        manager, control, reads = self.fixture()
+        manager._joint_read_cache = {}
+        first = control.get_action(manager, env_idx=0)
+        self.assertIs(control.get_action(manager, env_idx=0), first)
+        self.assertEqual(len(reads), 1)
+        # Another env or a new snapshot recomputes.
+        control.get_action(manager, env_idx=1)
+        manager._joint_read_cache = {}
+        control.get_action(manager, env_idx=1)
+        self.assertEqual(len(reads), 3)
+
+    def test_no_snapshot_never_memoizes(self):
+        manager, control, reads = self.fixture()
+        control.get_action(manager, env_idx=0)
+        control.get_action(manager, env_idx=0)
+        self.assertEqual(len(reads), 2)

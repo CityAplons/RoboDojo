@@ -23,6 +23,7 @@ from env.environment.isaac.compat import (
 )
 from env.environment.isaac.isaac_rl_env import IsaacRLEnv
 from env.seeding import seed_everywhere
+from utils import eval_profiler
 
 DEFAULT_SIM_DEVICE = "cpu"
 DEFAULT_USE_FABRIC = False
@@ -250,8 +251,10 @@ class BaseEnv(gym.Env):
         """
         self.update_seed(seed)
         if self.sim is None:
-            self.launch_sim(self.config)
-        self.sim.reset(options=options)
+            with eval_profiler.span("reset.launch_sim"):
+                self.launch_sim(self.config)
+        with eval_profiler.span("reset.sim_reset"):
+            self.sim.reset(options=options)
         ensure_legacy_physics_view(self.sim.sim)
 
     def _setup_scene(self, sim: IsaacRLEnv):

@@ -10,7 +10,11 @@ from isaaclab.app import AppLauncher
 MAX_INPROC_RESTARTS = 3
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--task_name", type=str)
+parser.add_argument(
+    "--task_name",
+    type=str,
+    help="Task to evaluate, or a comma-separated list evaluated sequentially in one Isaac Sim launch.",
+)
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
 parser.add_argument(
     "--env_cfg_type",
@@ -113,8 +117,16 @@ def _physx_monitor_needed(task_name) -> bool:
 if not os.environ.get("ROBODOJO_RUN_ID"):
     os.environ["ROBODOJO_RUN_ID"] = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-enable_monitor = _physx_monitor_needed(args_cli.task_name)
-print(f"[main] PhysX monitor enabled={enable_monitor} (task={args_cli.task_name})")
+TASK_NAMES = [name.strip() for name in (args_cli.task_name or "").split(",") if name.strip()]
+if not TASK_NAMES:
+    parser.error("--task_name is required")
+MULTI_TASK = len(TASK_NAMES) > 1
+# Per-task run ids derive from this base in multi-task mode; it survives os.execv restarts.
+os.environ.setdefault("ROBODOJO_BASE_RUN_ID", os.environ["ROBODOJO_RUN_ID"])
+
+# The monitor must be decided before Kit starts, so enable it if any task needs it.
+enable_monitor = any(_physx_monitor_needed(name) for name in TASK_NAMES)
+print(f"[main] PhysX monitor enabled={enable_monitor} (tasks={','.join(TASK_NAMES)})")
 if enable_monitor:
     # Start before AppLauncher so Kit inherits the redirected stdout/stderr fds.
     from src.eval_client.physx_warning_monitor import (
@@ -152,7 +164,10 @@ def _add_deprecated_exts_folder(args) -> None:
 _add_deprecated_exts_folder(args_cli)
 
 # launch omniverse app
-app_launcher = AppLauncher(args_cli)
+from utils import eval_profiler
+
+with eval_profiler.span("startup.app_launcher"):
+    app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 from omegaconf import OmegaConf
@@ -162,6 +177,7 @@ from src.eval_client.eval_env import create_eval_env
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
+from utils.save_file import save_json
 
 BENCHMARK_PATH = os.path.join(ROOT_DIR, "task", BENCHMARK)
 
@@ -277,11 +293,125 @@ def _exit_for_shell_restart(env, fatal_msg):
     os._exit(99)
 
 
-def main():
+def _task_done_marker_path(eval_cfg, run_id):
+    """Marks a finished task so multi-task restarts skip it (its resume manifest is deleted)."""
+    manifest = _resume_manifest_path(eval_cfg, run_id)
+    return os.path.join(os.path.dirname(manifest), f"_done_{run_id}.json")
+
+
+def _run_episodes(env, eval_num):
+    eval_time = env.success_nums + env.fail_nums
+    if eval_time >= eval_num:
+        # Already complete on resume - nothing left to do.
+        env.env_seeds = None
+    else:
+        env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
+    while env.env_seeds is not None:
+        retry_round = False
+        if enable_monitor:
+            get_monitor().reset()
+        bad_envs = None
+        try:
+            with eval_profiler.span("episode.reset"):
+                env.reset(seed=env.env_seeds)
+            with eval_profiler.span("episode.run_eval"), eval_profiler.cprofile(
+                os.path.join(env.save_dir, "run_eval.prof")
+            ):
+                env.run_eval()
+            env.seed_manager.eval_step()
+
+        except PhysXFatalError as e:
+            # Unrecoverable: GPU/CUDA context is dead. Persist progress
+            # and re-exec (or sys.exit(99) for bash to restart).
+            if not enable_monitor:
+                raise
+            if get_monitor().requires_shell_restart():
+                _exit_for_shell_restart(env, str(e))
+            _restart_or_exit(env, simulation_app, str(e))
+
+        except PhysXBrokenError as e:
+            # Monitor caught the warning in time.
+            bad_envs = sorted(e.broken_envs)
+
+        except UnStableError:
+            env.seed_manager.eval_step()
+        except Exception as e:
+            import traceback
+
+            print(
+                f"[Eval] unhandled exception during reset/run_eval: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            traceback.print_exc()
+            if os.environ.get("ROBODOJO_FAIL_FAST") == "1":
+                raise
+            if enable_monitor and get_monitor().is_fatal():
+                fatal_msg = get_monitor().get_fatal_message() or str(e)
+                if get_monitor().requires_shell_restart():
+                    _exit_for_shell_restart(env, fatal_msg)
+                _restart_or_exit(env, simulation_app, fatal_msg)
+            bad = {i for i in get_monitor().get_broken_envs() if i < env.num_envs} if enable_monitor else set()
+            if bad:
+                print(
+                    f"[PhysX] downstream exception {type(e).__name__} with "
+                    f"monitor broken_envs={sorted(bad)}; treating as PhysX break."
+                )
+                bad_envs = sorted(bad)
+            else:
+                env.seed_manager.eval_step()
+
+        if bad_envs is not None:
+            # Abandon broken-env seeds, refill from the seed queue, and
+            # retry this round iff there is at least one real seed left.
+            bad_seeds = env.get_seeds_for_envs(bad_envs)
+            env.abandoned_seeds.update(bad_seeds)
+
+            replacements = env.seed_manager.get_seeds(max_count=len(bad_envs)) or []
+            bad_env_set = set(bad_envs)
+            new_batch = [None] * env.num_envs
+            for env_idx, seed in env.current_env_seed_map.items():
+                if env_idx not in bad_env_set:
+                    new_batch[env_idx] = seed
+            for k, env_idx in enumerate(bad_envs):
+                if k < len(replacements):
+                    new_batch[env_idx] = replacements[k]
+            env.env_seeds = new_batch
+
+            real_remaining = sum(1 for s in env.env_seeds if s is not None)
+            print(
+                f"[PhysX] broken envs={bad_envs} -> abandon seeds={sorted(bad_seeds)}; "
+                f"refill from queue={replacements}; new batch={env.env_seeds}; "
+                f"real_remaining={real_remaining}"
+            )
+            env.close()
+            if real_remaining == 0:
+                print("[PhysX] no real seeds remaining in this batch, advancing.")
+                retry_round = False
+            else:
+                retry_round = True
+
+        if retry_round:
+            continue
+
+        print(f"Success nums: {env.success_nums}, Fail nums: {env.fail_nums}, Unstable nums: {env.unstable_nums}")
+        eval_time = env.success_nums + env.fail_nums
+        if eval_time >= eval_num:
+            break
+
+        env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
+        if env.env_seeds is None:
+            print("No more seeds to run, exiting.")
+            break
+
+        with eval_profiler.span("episode.close"):
+            env.close()
+
+
+
+def run_task(task_name):
     """Assemble the env config, build the eval env, and run the eval loop with
     PhysX crash/resume recovery until the requested episode count is reached.
     """
-    task_name = args_cli.task_name
     num_envs = args_cli.num_envs
     eval_cfg_name = args_cli.env_cfg_type
     eval_cfg = load_yaml(os.path.join(ENV_CONFIG_PATH, eval_cfg_name + ".yml"))
@@ -368,113 +498,62 @@ def main():
 
     env_cfg.sim.seed = [0 for _ in range(num_envs)]
     run_id = os.environ["ROBODOJO_RUN_ID"]
+    done_marker = _task_done_marker_path(eval_cfg, run_id)
+    if MULTI_TASK and os.path.exists(done_marker):
+        print(f"[main] task {task_name} already completed for run_id={run_id}; skipping.")
+        return
     resume_state = _load_resume_manifest(eval_cfg, run_id)
-    env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
-    eval_time = env.success_nums + env.fail_nums
-    if eval_time >= eval_num:
-        # Already complete on resume - nothing left to do.
-        env.env_seeds = None
-    else:
-        env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
-    while env.env_seeds is not None:
-        retry_round = False
-        if enable_monitor:
-            get_monitor().reset()
-        bad_envs = None
-        try:
-            env.reset(seed=env.env_seeds)
-            env.run_eval()
-            env.seed_manager.eval_step()
-
-        except PhysXFatalError as e:
-            # Unrecoverable: GPU/CUDA context is dead. Persist progress
-            # and re-exec (or sys.exit(99) for bash to restart).
-            if not enable_monitor:
-                raise
-            if get_monitor().requires_shell_restart():
-                _exit_for_shell_restart(env, str(e))
-            _restart_or_exit(env, simulation_app, str(e))
-
-        except PhysXBrokenError as e:
-            # Monitor caught the warning in time.
-            bad_envs = sorted(e.broken_envs)
-
-        except UnStableError:
-            env.seed_manager.eval_step()
-        except Exception as e:
-            import traceback
-
-            print(
-                f"[Eval] unhandled exception during reset/run_eval: {type(e).__name__}: {e}",
-                flush=True,
-            )
-            traceback.print_exc()
-            if os.environ.get("ROBODOJO_FAIL_FAST") == "1":
-                raise
-            if enable_monitor and get_monitor().is_fatal():
-                fatal_msg = get_monitor().get_fatal_message() or str(e)
-                if get_monitor().requires_shell_restart():
-                    _exit_for_shell_restart(env, fatal_msg)
-                _restart_or_exit(env, simulation_app, fatal_msg)
-            bad = {i for i in get_monitor().get_broken_envs() if i < env.num_envs} if enable_monitor else set()
-            if bad:
-                print(
-                    f"[PhysX] downstream exception {type(e).__name__} with "
-                    f"monitor broken_envs={sorted(bad)}; treating as PhysX break."
-                )
-                bad_envs = sorted(bad)
-            else:
-                env.seed_manager.eval_step()
-
-        if bad_envs is not None:
-            # Abandon broken-env seeds, refill from the seed queue, and
-            # retry this round iff there is at least one real seed left.
-            bad_seeds = env.get_seeds_for_envs(bad_envs)
-            env.abandoned_seeds.update(bad_seeds)
-
-            replacements = env.seed_manager.get_seeds(max_count=len(bad_envs)) or []
-            bad_env_set = set(bad_envs)
-            new_batch = [None] * env.num_envs
-            for env_idx, seed in env.current_env_seed_map.items():
-                if env_idx not in bad_env_set:
-                    new_batch[env_idx] = seed
-            for k, env_idx in enumerate(bad_envs):
-                if k < len(replacements):
-                    new_batch[env_idx] = replacements[k]
-            env.env_seeds = new_batch
-
-            real_remaining = sum(1 for s in env.env_seeds if s is not None)
-            print(
-                f"[PhysX] broken envs={bad_envs} -> abandon seeds={sorted(bad_seeds)}; "
-                f"refill from queue={replacements}; new batch={env.env_seeds}; "
-                f"real_remaining={real_remaining}"
-            )
-            env.close()
-            if real_remaining == 0:
-                print("[PhysX] no real seeds remaining in this batch, advancing.")
-                retry_round = False
-            else:
-                retry_round = True
-
-        if retry_round:
-            continue
-
-        print(f"Success nums: {env.success_nums}, Fail nums: {env.fail_nums}, Unstable nums: {env.unstable_nums}")
-        eval_time = env.success_nums + env.fail_nums
-        if eval_time >= eval_num:
-            break
-
-        env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
-        if env.env_seeds is None:
-            print("No more seeds to run, exiting.")
-            break
-
-        env.close()
+    with eval_profiler.span("task.create_eval_env"):
+        env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+    try:
+        _run_episodes(env, eval_num)
+    except Exception:
+        if MULTI_TASK:
+            # Release this task's stage and policy connection before the next task.
+            _close_model_client(env)
+            try:
+                env.close()
+            except Exception as close_error:
+                print(f"[main] env.close after failure raised: {close_error}")
+        raise
 
     _delete_resume_manifest(env)
     _close_model_client(env)
     env.close()
+    if MULTI_TASK:
+        save_json({"task_name": task_name, "run_id": run_id, "save_dir": env.save_dir}, done_marker)
+
+
+def main():
+    if not MULTI_TASK:
+        run_task(TASK_NAMES[0])
+        simulation_app.close()
+        return
+
+    base_run_id = os.environ["ROBODOJO_BASE_RUN_ID"]
+    failed = []
+    for index, task_name in enumerate(TASK_NAMES):
+        # Same per-task layout the sweep scripts use, so results land in separate dirs.
+        os.environ["ROBODOJO_RUN_ID"] = f"{base_run_id}_{task_name}"
+        if index > 0:
+            eval_profiler.reset()
+        print(f"[main] multi-task {index + 1}/{len(TASK_NAMES)}: {task_name} (run_id={os.environ['ROBODOJO_RUN_ID']})")
+        try:
+            run_task(task_name)
+        except Exception as e:
+            import traceback
+
+            print(f"[main] task {task_name} failed: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            failed.append(task_name)
+            if os.environ.get("ROBODOJO_FAIL_FAST") == "1":
+                break
+    os.environ["ROBODOJO_RUN_ID"] = base_run_id
+    if failed:
+        print(f"[main] multi-task finished with failed tasks: {','.join(failed)}")
     simulation_app.close()
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

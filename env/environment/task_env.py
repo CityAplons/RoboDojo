@@ -5,6 +5,7 @@ from env.environment.base_env import BaseEnv
 from env.robot_manager.control_manager import ControlSeq
 from env.robot_manager.robot_manager import RobotManager
 from env.scene_manager.scene_manager import SceneManager
+from utils import eval_profiler
 
 
 class TaskEnv(BaseEnv):
@@ -82,12 +83,15 @@ class TaskEnv(BaseEnv):
 
     def reset(self, seed: Any | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed, options=options)
-        self.scene_manager.reload_scene()
+        with eval_profiler.span("reset.reload_scene"):
+            self.scene_manager.reload_scene()
         self.robot_manager.reset()
-        for _ in range(300):
-            self.sim_step(render=False)
-        self.camera_manager.reset()
-        self.capture_manager.reset()
+        with eval_profiler.span("reset.warmup_steps"):
+            for _ in range(300):
+                self.sim_step(render=False)
+        with eval_profiler.span("reset.cameras"):
+            self.camera_manager.reset()
+            self.capture_manager.reset()
 
     def step(self, meta_control_list: List[ControlSeq]):
         self.robot_manager.control_robot(meta_control_list=meta_control_list)

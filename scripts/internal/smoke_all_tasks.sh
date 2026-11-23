@@ -34,6 +34,7 @@ tasks_file=""
 dimensions=""
 resume="false"
 fail_fast="false"
+single_launch="false"
 dry_run="false"
 limit=""
 
@@ -56,6 +57,8 @@ Options:
   --env-gpu-ids IDS     Optional per-worker env GPU ids. Defaults to --gpu-ids.
   --resume            Skip tasks already marked PASS in the summary file.
   --fail-fast         Stop after the first failed task.
+  --single-launch     Client mode only: run each worker's tasks in one Isaac Sim launch
+                      (robodojo.sh client --task a,b,c) instead of one launch per task.
   --dry-run           Print eval commands and mark tasks DRY_RUN without launching eval.
   --all               Explicitly run all runnable tasks (default when --only is omitted).
   --limit NUM         Run only the first NUM tasks after filtering.
@@ -117,6 +120,7 @@ while [[ $# -gt 0 ]]; do
     --resume) resume="true"; shift ;;
     --all) shift ;;
     --fail-fast) fail_fast="true"; shift ;;
+    --single-launch) single_launch="true"; shift ;;
     --dry-run) dry_run="true"; shift ;;
     --limit) need_value "$@"; limit="$2"; shift 2 ;;
     --summary) need_value "$@"; summary_path="$2"; shift 2 ;;
@@ -201,6 +205,11 @@ else
     exit 1
   fi
   policy_name="$(basename "$(cd "${policy_dir}" && pwd)")"
+fi
+
+if [[ "${single_launch}" == "true" && "${execution_mode}" != "client" ]]; then
+  echo "[smoke_all_tasks] --single-launch is only supported in client mode" >&2
+  exit 2
 fi
 
 summary_path="${summary_path:-${ROOT_DIR}/smoke_results/${run_id}.json}"
@@ -864,6 +873,85 @@ run_server_for_group() {
   exec "${server_cmd[@]}"
 }
 
+# Run several tasks in one client process (one Isaac Sim launch). main.py derives
+# each task's run id as "${run_id}_${task}", the same layout run_eval_for_task
+# uses, and writes a _done_<run_id>.json marker per completed task.
+run_client_batch() {
+  local target_tsv="$1"
+  local task_env_gpu="$2"
+  local task_host="$3"
+  local task_port="$4"
+  local batch_name="$5"
+  shift 5
+  local -a batch_tasks=("$@")
+  local task_csv log_path rc start_sec elapsed task task_run_id result_dir result_path done_path eval_time message
+  local failed="0"
+
+  [[ "${#batch_tasks[@]}" -gt 0 ]] || return 0
+  task_csv="$(IFS=,; echo "${batch_tasks[*]}")"
+  log_path="${log_dir}/${batch_name}.log"
+  echo "[smoke_all_tasks] RUN single-launch ${task_csv} (host=${task_host}, port=${task_port}, env_gpu=${task_env_gpu})"
+
+  local -a batch_cmd=(
+    bash "${ROOT_DIR}/scripts/robodojo.sh" client
+    --dataset "${dataset}"
+    --task "${task_csv}"
+    --env-cfg "${env_cfg}"
+    --policy-name "${policy_name}"
+    --policy-host "${task_host}"
+    --policy-port "${task_port}"
+    --seed "${seed}"
+    --env-gpu "${task_env_gpu}"
+    --ckpt "${ckpt}"
+    --action-type "${action_type}"
+    --connect-timeout "${connect_timeout}"
+  )
+  if [[ "${eval_num}" != "native" ]]; then
+    batch_cmd+=(--eval-num "${eval_num}")
+  fi
+  if [[ "${dry_run}" == "true" ]]; then
+    batch_cmd+=(--dry-run)
+  fi
+
+  start_sec="$(date +%s)"
+  set +e
+  ROBODOJO_RUN_ID="${run_id}" \
+  ROBODOJO_FATAL_RESTART_COUNT=0 \
+  ROBODOJO_FAIL_FAST="$([[ "${fail_fast}" == "true" ]] && echo 1 || echo 0)" \
+  "${batch_cmd[@]}" \
+    > "${log_path}" 2>&1
+  rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - start_sec ))
+
+  for task in "${batch_tasks[@]}"; do
+    task_run_id="${run_id}_${task}"
+    result_dir="${ROOT_DIR}/eval_result/RoboDojo/${task}/${policy_name}/${env_cfg}/${seed}_ckpt_name=${ckpt},action_type=${action_type}"
+    result_path="${result_dir}/${task_run_id}/_result.json"
+    done_path="${result_dir}/_done_${task_run_id}.json"
+    if [[ "${dry_run}" == "true" ]]; then
+      record_result_row "${target_tsv}" "DRY_RUN" "${task}" "${rc}" "-" "${elapsed}" "${result_path}" "${log_path}" "command rendered only"
+      continue
+    fi
+    eval_time="-"
+    message=""
+    if [[ -f "${result_path}" ]]; then
+      eval_time="$(extract_eval_time "${result_path}")"
+    else
+      message="missing _result.json"
+    fi
+    # A single-task batch writes no done marker; fall back to the exit code.
+    if [[ "${eval_time}" =~ ^[0-9]+$ && "${eval_time}" -ge 1 ]] \
+      && { [[ -f "${done_path}" ]] || [[ "${#batch_tasks[@]}" -eq 1 && "${rc}" -eq 0 ]]; }; then
+      record_result_row "${target_tsv}" "PASS" "${task}" "${rc}" "${eval_time}" "${elapsed}" "${result_path}" "${log_path}" "ok (single-launch batch)"
+    else
+      failed="1"
+      record_result_row "${target_tsv}" "FAIL" "${task}" "${rc}" "${eval_time}" "${elapsed}" "${result_path}" "${log_path}" "${message:-batch exit=${rc}, eval_time=${eval_time}, no done marker}"
+    fi
+  done
+  [[ "${failed}" == "0" ]]
+}
+
 run_parallel_group() {
   local worker_id="$1"
   local task_policy_gpu="$2"
@@ -874,6 +962,18 @@ run_parallel_group() {
   local task_host="${7:-}"
   local task_port="${8:-}"
   local task failed="0"
+
+  if [[ "${single_launch}" == "true" ]]; then
+    local -a group_tasks=()
+    while IFS= read -r task || [[ -n "${task}" ]]; do
+      [[ -n "${task}" ]] && group_tasks+=("${task}")
+    done < "${task_file}"
+    if ! run_client_batch "${target_tsv}" "${task_env_gpu}" "${task_host}" "${task_port}" "client_batch_${worker_id}" "${group_tasks[@]}"; then
+      [[ "${fail_fast}" == "true" ]] && : > "${fail_flag}"
+      return 1
+    fi
+    return 0
+  fi
 
   while IFS= read -r task || [[ -n "${task}" ]]; do
     [[ -n "${task}" ]] || continue
@@ -906,6 +1006,12 @@ run_sequential_tasks() {
     resolve_server_endpoints 1
     run_server_for_group "${ACTIVE_TASKS[0]}" "${policy_gpu}" "${SERVER_HOST_WORKERS[0]}" "${SERVER_PORT_WORKERS[0]}"
     return $?
+  fi
+  if [[ "${single_launch}" == "true" ]]; then
+    local batch_rc=0
+    run_client_batch "${RESULTS_TSV}" "${env_gpu}" "${task_host}" "${task_port}" "client_batch" "${ACTIVE_TASKS[@]}" || batch_rc=1
+    write_summaries
+    return "${batch_rc}"
   fi
   for task in "${ACTIVE_TASKS[@]}"; do
     if ! run_eval_for_task "${task}" "${policy_gpu}" "${env_gpu}" "${RESULTS_TSV}" "${task_host}" "${task_port}"; then
