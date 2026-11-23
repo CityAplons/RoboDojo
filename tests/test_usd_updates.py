@@ -47,7 +47,9 @@ class UsdUpdatesTest(unittest.TestCase):
             get_physx_update_transformations_settings=lambda: tuple(state),
             set_physx_update_transformations_settings=configure,
         )
-        physical = load_class("env/environment/isaac/direct_rl_env.py", "CustomDirectRLEnv", ["sim_step"], {})()
+        physical = load_class(
+            "env/environment/isaac/direct_rl_env.py", "CustomDirectRLEnv", ["_needs_render", "sim_step"], {}
+        )()
         physical.cfg = SimpleNamespace(decimation=inner, sim=SimpleNamespace(render_interval=0), events=None)
         physical._sim_step_counter = physical.common_step_counter = physical.episode_length_buf = 0
         physical.physics_dt = 0.004

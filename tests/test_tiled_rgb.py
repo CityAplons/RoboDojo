@@ -2,6 +2,7 @@
 
 import ast
 from copy import deepcopy
+import os
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -39,7 +40,7 @@ def _load_camera_functions():
             )
     module = ModuleType("_robodojo_tiled_rgb_test")
     module.__file__ = str(path)
-    module.__dict__.update(wp=wp, Any=Any, Tuple=Tuple)
+    module.__dict__.update(os=os, wp=wp, Any=Any, Tuple=Tuple)
     sys.modules[module.__name__] = module
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), module.__dict__)
     return module
